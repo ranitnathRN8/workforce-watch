@@ -2,7 +2,7 @@ name: Weekly scrape & Deploy Pages
 
 on:
   schedule:
-    - cron: '30 0 * * 1'   # Mon 00:30 UTC (~06:00 IST)
+    - cron: '30 0 * * 3'   # Mon 00:30 UTC (~06:00 IST)
   workflow_dispatch: {}
 
 permissions:
