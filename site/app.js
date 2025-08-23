@@ -207,7 +207,7 @@ function setItems(items, meta) {
 }
 
 async function loadWeek(year, week) {
-  const path = `/data/${year}/${year}-W${pad2(week)}.json`;
+  const path = `data/${year}/${year}-W${pad2(week)}.json`;
   try {
     const data = await fetchJSON(path);
     setItems(data.items || [], data);
