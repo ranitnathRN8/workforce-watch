@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Workforce Watch — Weekly Digest</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Workforce Watch — Weekly Digest</h1>
+    </header>
+
+    <!-- Controls: responsive grid -->
+    <div class="controls" role="region" aria-label="Filters and actions">
+      <!-- Date group -->
+      <div class="ctrl ctrl-date">
+        <label for="day" class="ctrl-label">Pick a date</label>
+        <div class="date-row">
+          <div class="date-input">
+            <button id="openPicker" class="icon-btn" title="Show date picker" aria-label="Show date picker">
+              <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
+                <path fill="currentColor" d="M7 2a1 1 0 0 1 1 1v1h8V3a1 1 0 1 1 2 0v1h1a3 3 0 0 1 3 3v11a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3V7a3 3 0 0 1 3-3h1V3a1 1 0 0 1 1-1m12 6H5v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1z"/>
+              </svg>
+            </button>
+            <input type="date" id="day" />
+          </div>
+          <button id="loadToday" class="btn secondary">Today</button>
+        </div>
+      </div>
+
+      <!-- Category -->
+      <div class="ctrl ctrl-category">
+        <label for="category" class="ctrl-label">Category</label>
+        <select id="category" title="Category"></select>
+      </div>
+
+      <!-- Search fills remaining space -->
+      <div class="ctrl ctrl-search">
+        <label class="ctrl-label" for="search">Search</label>
+        <div class="search-input">
+          <svg width="18" height="18" viewBox="0 0 24 24" class="search-ico" aria-hidden="true">
+            <path fill="currentColor" d="M9.5 3a6.5 6.5 0 0 1 5.19 10.5l4.9 4.9a1 1 0 0 1-1.42 1.42l-4.9-4.9A6.5 6.5 0 1 1 9.5 3m0 2a4.5 4.5 0 1 0 0 9a4.5 4.5 0 0 0 0-9"/>
+          </svg>
+          <input type="text" id="search" placeholder="Search title, bullets, companies…" aria-label="Search" />
+        </div>
+      </div>
+    </div>
+
+    <div id="meta" class="meta"></div>
+    <div id="results" class="grid" aria-live="polite"></div>
+    <!-- pagination injected after #results -->
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
