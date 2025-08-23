@@ -1,37 +1,45 @@
+name: Weekly scrape & Deploy Pages
 
-name: Weekly HR News Build
 on:
   schedule:
-    # Monday 08:00 IST (IST=UTC+5:30 => 02:30 UTC)
-    - cron: "30 2 * * 1"
+    - cron: '30 0 * * 1'   # Mon 00:30 UTC (~06:00 IST)
   workflow_dispatch: {}
 
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run scraper
+      - name: Run scraper (produces site/data/YYYY/YYYY-Wxx.json)
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: python scraper/run.py
-
-      - name: Commit updated data
+          SHRM_COVEO_TOKEN: ${{ secrets.SHRM_COVEO_TOKEN }}
         run: |
-          git config user.name "github-actions"
-          git config user.email "actions@users.noreply.github.com"
-          git add data/
-          git commit -m "Weekly data update" || echo "No changes"
-          git push
+          python scraper/run.py --week current
+
+      - name: Upload artifact for Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
