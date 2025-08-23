@@ -17,26 +17,30 @@ that a simple website can browse by **Year** and **ISO Week** or via a **Today**
    ```bash
    export GEMINI_API_KEY=your_key_here
    ```
+3. **Set the SHRM auth token** (create `.env` or export directly):
+   ```bash
+   export SHRM_COVEO_TOKEN=your_token_here
+   ```
 
-3. **Run locally**:
+4. **Run locally**:
    ```bash
    python scraper/run.py
    ```
    This will create weekly and daily JSON files under `data/<year>/`.
 
-4. **Open the site locally** (no build step needed):
+5. **Open the site locally** (no build step needed):
    - Serve `site/` with any static server, e.g.
      ```bash
      python -m http.server --directory site 8080
      ```
      and browse http://localhost:8080
 
-5. **Deploy**:
+6. **Deploy**:
    - Push to GitHub.
    - Add `GEMINI_API_KEY` as a GitHub Actions secret.
    - The workflow `.github/workflows/weekly.yml` runs every Monday 08:00 IST and commits new JSON.
 
-6. **Protect the site**:
+7. **Protect the site**:
    - Recommended: Cloudflare Pages + Cloudflare Access (Zero Trust) to require email/SSO login.
 
 ## Data Layout
