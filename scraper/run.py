@@ -19,6 +19,8 @@ import uuid
 import datetime
 from typing import Optional, List, Tuple, Dict, Any
 from urllib.parse import urljoin, urlparse
+import time
+import random
 
 import requests
 from requests.adapters import HTTPAdapter, Retry
@@ -389,6 +391,74 @@ def parse_json_lenient(text: str) -> Optional[List[dict]]:
 
 
 # ------------------------ Summarization (Gemini 2.0 Flash) ------------------------
+# ---- NEW: Simple per-minute rate limiter -----------------------------------
+class RateLimiter:
+    def __init__(self, rpm: int):
+        rpm = max(1, int(rpm))
+        self.interval = 60.0 / float(rpm)  # seconds between calls
+        self._next_allowed = 0.0
+
+    def wait(self):
+        now = time.time()
+        if now < self._next_allowed:
+            time.sleep(self._next_allowed - now)
+        self._next_allowed = time.time() + self.interval
+
+
+def _extract_retry_delay_secs(err_text: str) -> float:
+    """Parse 'retry_delay { seconds: N }' if present; else return 0."""
+    m = re.search(r"retry_delay\s*{\s*seconds:\s*(\d+)\s*}", err_text, flags=re.I)
+    if m:
+        try:
+            return float(m.group(1))
+        except Exception:
+            pass
+    return 0.0
+
+
+def _call_gemini(model, limiter: RateLimiter, prompt: str,
+                 max_retries: int, base_backoff: float, jitter_frac: float):
+    """
+    One guarded call: rate-limited + retry on 429 (uses server retry_delay if present).
+    Returns response.text or raises the last exception.
+    """
+    last_exc = None
+    for attempt in range(max_retries):
+        # Respect RPM
+        limiter.wait()
+        try:
+            resp = model.generate_content(prompt)
+            txt = (getattr(resp, "text", None) or "").strip()
+            if not txt:
+                # treat as transient
+                raise RuntimeError("Empty response from model")
+            return txt
+        except Exception as e:
+            err_s = str(e)
+            # If it's a 429, obey retry_delay if provided
+            if "429" in err_s or "rate limit" in err_s.lower():
+                srv_delay = _extract_retry_delay_secs(err_s)
+                if srv_delay > 0:
+                    time.sleep(srv_delay + random.uniform(0, 0.5))
+                else:
+                    # exponential backoff + jitter
+                    sleep_for = base_backoff * (2 ** attempt)
+                    jitter = sleep_for * random.uniform(-jitter_frac, jitter_frac)
+                    time.sleep(max(0.5, sleep_for + jitter))
+                last_exc = e
+                continue
+            # other transient network-ish errors → small backoff
+            if any(t in err_s.lower() for t in ["deadline", "timeout", "temporar", "unavailable"]):
+                time.sleep(1.5 + random.uniform(0, 0.5))
+                last_exc = e
+                continue
+            # non-retriable: bubble up
+            raise
+    # exhausted retries
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Unknown failure in _call_gemini")
+
 def _dump_model_text(prefix: str, text: str) -> str:
     os.makedirs("logs", exist_ok=True)
     fname = f"logs/{prefix}-{uuid.uuid4().hex[:8]}.txt"
@@ -400,23 +470,39 @@ def _dump_model_text(prefix: str, text: str) -> str:
     return fname
 
 def summarize_bullets(items: List[dict]) -> Dict[str, dict]:
-    """Return {url: {bullets, companies, significance, category}} with robust parsing."""
+    """Return {url: {bullets, companies, significance, category}} with robust parsing + RPM limiter."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         print("[warn] GEMINI_API_KEY missing; skipping model summaries.")
         return {}
 
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(
-        "gemini-2.0-flash",
-        generation_config={"temperature": 0.3, "response_mime_type": "application/json"},
-    )
+
+    # Tuning knobs
+    rpm          = int(os.getenv("GEMINI_RPM", "10"))
+    max_retries  = int(os.getenv("GEMINI_MAX_RETRIES", "6"))
+    backoff_base = float(os.getenv("GEMINI_BACKOFF_BASE", "2.0"))
+    jitter_frac  = float(os.getenv("GEMINI_BACKOFF_JITTER", "0.35"))
+
+    model_primary  = os.getenv("GEMINI_MODEL_PRIMARY", "gemini-2.0-flash")
+    model_fallback = os.getenv("GEMINI_MODEL_FALLBACK", "gemini-2.0-flash-lite")
+
+    def make_model(name: str):
+        return genai.GenerativeModel(
+            name,
+            generation_config={
+                "temperature": 0.3,
+                "response_mime_type": "application/json",
+            },
+        )
+
+    model = make_model(model_primary)
+    limiter = RateLimiter(rpm)
 
     taxonomy_str = ", ".join(CATEGORY_TAXONOMY)
     out: Dict[str, dict] = {}
 
     def coerce_significance(val: Any) -> int:
-        """Force significance to int 1..5 safely."""
         try:
             if isinstance(val, bool):
                 s = 3
@@ -438,7 +524,6 @@ def summarize_bullets(items: List[dict]) -> Dict[str, dict]:
             excerpt = (body[:1600] + "...") if len(body) > 1600 else body
             listing.append(f"- URL: {it['url']}\n  Title: {it['title']}\n  Excerpt: {excerpt}")
 
-        # Conservative but strict prompt (won't break working behavior)
         prompt = (
             "You are an expert HR analyst. For each item below, return ONLY a JSON array; "
             "no markdown, no commentary. For EVERY item include EXACTLY these keys:\n"
@@ -451,76 +536,72 @@ def summarize_bullets(items: List[dict]) -> Dict[str, dict]:
             "Items:\n" + "\n".join(listing)
         )
 
+        # Primary model call with guarded rate-limit + retry
         try:
-            resp = model.generate_content(prompt)
-            raw = (getattr(resp, "text", None) or "").strip()
-            data = parse_json_lenient(raw)
-            if data is None:
-                path = _dump_model_text("summarize_raw", raw)
-                # Try a single reformat attempt
-                retry = model.generate_content(
-                    "Reformat STRICTLY as a JSON array. Each object must have keys: "
-                    'url, bullets, companies, significance, category. No extra keys, no commentary.\n\n'
-                    + raw
-                )
-                raw2 = (getattr(retry, "text", None) or "").strip()
-                data = parse_json_lenient(raw2)
-                if data is None:
-                    path2 = _dump_model_text("summarize_retry_raw", raw2)
-                    print(f"[warn] summarization batch failed; logs: {path}, {path2}")
-                    continue
-
-            for obj in data:
-                try:
-                    url = obj.get("url")
-                    if not url:
-                        continue
-
-                    # bullets
-                    bullets = obj.get("bullets") or []
-                    if isinstance(bullets, str):
-                        bullets = [bullets]
-                    bullets = [clean_bullet(x) for x in bullets if isinstance(x, str) and x.strip()]
-                    if len(bullets) > 4:
-                        bullets = bullets[:4]
-                    # If too few bullets, we still accept (don’t break successful behavior)
-
-                    # companies
-                    companies = obj.get("companies") or []
-                    if isinstance(companies, str):
-                        companies = [companies]
-                    companies = [c.strip() for c in companies if isinstance(c, str) and c.strip()]
-                    # de-dup companies, keep order
-                    seen_c, uniq_c = set(), []
-                    for c in companies:
-                        lc = c.lower()
-                        if lc in seen_c: 
-                            continue
-                        seen_c.add(lc); uniq_c.append(c)
-                    companies = uniq_c[:8]
-
-                    # significance
-                    sig = coerce_significance(obj.get("significance"))
-
-                    # category
-                    cat = snap_to_taxonomy(obj.get("category"))
-                    if not cat:
-                        cat = "Workplace Policy & Culture"  # safe default
-
-                    out[url] = {
-                        "bullets": bullets,
-                        "companies": companies,
-                        "significance": sig,
-                        "category": cat
-                    }
-                except Exception:
-                    continue
-
+            raw = _call_gemini(model, limiter, prompt, max_retries, backoff_base, jitter_frac)
         except Exception as e:
-            print("[warn] summarize fail:", e)
+            # If repeated 429 / failures → one last try on fallback model
+            try:
+                print("[warn] primary model failed; retrying on fallback:", model_fallback)
+                model_fb = make_model(model_fallback)
+                raw = _call_gemini(model_fb, limiter, prompt, max_retries, backoff_base, jitter_frac)
+            except Exception as e2:
+                print("[warn] summarize fail (both models):", e2)
+                # Skip this batch but continue
+                continue
+
+        data = parse_json_lenient(raw)
+        if data is None:
+            # one more formatting retry using the same model
+            try:
+                fix_prompt = (
+                    "Reformat STRICTLY as a JSON array. Each object must have keys: "
+                    "url, bullets, companies, significance, category. "
+                    "No extra keys, no commentary.\n\n" + raw
+                )
+                raw2 = _call_gemini(model, limiter, fix_prompt, max_retries, backoff_base, jitter_frac)
+                data = parse_json_lenient(raw2)
+            except Exception as e:
+                print("[warn] summarization batch failed to parse:", e)
+                continue
+
+        for obj in data:
+            try:
+                url = obj.get("url")
+                if not url:
+                    continue
+                bullets = obj.get("bullets") or []
+                if isinstance(bullets, str):
+                    bullets = [bullets]
+                bullets = [clean_bullet(x) for x in bullets if isinstance(x, str) and x.strip()]
+                bullets = bullets[:4] if len(bullets) > 4 else bullets
+
+                companies = obj.get("companies") or []
+                if isinstance(companies, str):
+                    companies = [companies]
+                companies = [c.strip() for c in companies if isinstance(c, str) and c.strip()]
+                seen_c, uniq_c = set(), []
+                for c in companies:
+                    lc = c.lower()
+                    if lc in seen_c: 
+                        continue
+                    seen_c.add(lc)
+                    uniq_c.append(c)
+                companies = uniq_c[:8]
+
+                sig = coerce_significance(obj.get("significance"))
+                cat = snap_to_taxonomy(obj.get("category")) or "Workplace Policy & Culture"
+
+                out[url] = {
+                    "bullets": bullets,
+                    "companies": companies,
+                    "significance": sig,
+                    "category": cat
+                }
+            except Exception:
+                continue
 
     return out
-
 
 # ------------------------ De-dup & diversity ------------------------
 def semantic_dedup(items: List[dict]) -> List[dict]:
