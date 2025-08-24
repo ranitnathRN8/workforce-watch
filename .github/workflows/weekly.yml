@@ -28,12 +28,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # - name: Run scraper (produces site/data/YYYY/YYYY-Wxx.json)
-      #   env:
-      #     GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      #     SHRM_COVEO_TOKEN: ${{ secrets.SHRM_COVEO_TOKEN }}
-      #   run: |
-      #     python scraper/run.py --week current
+      - name: Run scraper (produces site/data/YYYY/YYYY-Wxx.json)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SHRM_COVEO_TOKEN: ${{ secrets.SHRM_COVEO_TOKEN }}
+        run: |
+          python scraper/run.py --week current
 
       - name: Upload artifact for Pages
         uses: actions/upload-pages-artifact@v3
