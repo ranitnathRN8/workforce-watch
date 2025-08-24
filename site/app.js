@@ -18,15 +18,32 @@ const state = {
 };
 
 /* ---------- Helpers ---------- */
-function isoWeek(date) {
-  // ISO-8601 week calculation
-  const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
-  const dayNum = d.getUTCDay() || 7;
-  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
-  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
-  const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
-  return [d.getUTCFullYear(), weekNo];
+
+// Local yyyy-mm-dd without using UTC (prevents off-by-one day in IST, etc.)
+function localISODate(d = new Date()) {
+  const tz = d.getTimezoneOffset() * 60000; // minutes -> ms
+  return new Date(d.getTime() - tz).toISOString().slice(0, 10);
 }
+
+// Parse yyyy-mm-dd as a local date (anchor at noon to dodge DST/UTC edges)
+function parseLocalDate(yyyy_mm_dd) {
+  // Midday avoids accidental previous/next day shifts
+  return new Date(`${yyyy_mm_dd}T12:00:00`);
+}
+
+// Return local ISO week as { year: 2025, week: 34 }  (week is NUMBER)
+function isoWeekLocal(d) {
+  // Use a UTC-anchored clone for ISO-week math, but from the LOCAL date
+  const date = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  // Thursday in current week decides the year
+  const dow = date.getUTCDay() || 7;                // 1..7
+  date.setUTCDate(date.getUTCDate() + 4 - dow);     // move to Thursday
+  const year = date.getUTCFullYear();
+  const yearStart = new Date(Date.UTC(year, 0, 1));
+  const week = Math.ceil((((date - yearStart) / 86400000) + 1) / 7);
+  return { year, week };
+}
+
 const pad2 = (n) => (n < 10 ? `0${n}` : `${n}`);
 
 async function fetchJSON(path) {
@@ -223,10 +240,10 @@ function attachEvents() {
   // Auto-load the week when date changes
   $("#day").addEventListener("change", () => {
     const v = $("#day").value;
-    const d = v ? new Date(v) : new Date();
-    if (isNaN(d)) return;
-    const [y, w] = isoWeek(d);
-    loadWeek(y, w);
+    if (!v) return;
+    const d = parseLocalDate(v);
+    const { year, week } = isoWeekLocal(d);
+    loadWeek(year, week);
   });
 
   // Calendar icon opens the picker
@@ -236,12 +253,12 @@ function attachEvents() {
     else el.focus();
   });
 
-  // Today: set date + load
+  // Today: set date + load (LOCAL today)
   $("#loadToday").addEventListener("click", () => {
-    const d = new Date();
-    $("#day").value = d.toISOString().slice(0,10);
-    const [y, w] = isoWeek(d);
-    loadWeek(y, w);
+    const today = localISODate(new Date());
+    $("#day").value = today;
+    const { year, week } = isoWeekLocal(parseLocalDate(today));
+    loadWeek(year, week);
   });
 
   $("#category").addEventListener("change", () => {
@@ -256,10 +273,10 @@ function attachEvents() {
 }
 
 window.addEventListener("DOMContentLoaded", () => {
-  // Default: today
-  const d = new Date();
-  $("#day").value = d.toISOString().slice(0,10);
+  // Default: local today
+  const today = localISODate(new Date());
+  $("#day").value = today;
   attachEvents();
-  const [y, w] = isoWeek(d);
-  loadWeek(y, w);
+  const { year, week } = isoWeekLocal(parseLocalDate(today));
+  loadWeek(year, week);
 });

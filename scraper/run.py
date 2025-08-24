@@ -805,7 +805,7 @@ def main():
         "generated_at": now.isoformat(),
         "items": final_items
     }
-    out_dir = os.path.join("data", str(year))
+    out_dir = os.path.join("site", "data", str(year))
     os.makedirs(out_dir, exist_ok=True)
     week_path = os.path.join(out_dir, f"{week_str}.json")
     day_path  = os.path.join(out_dir, f"{now.date().isoformat()}.json")
