@@ -25,20 +25,15 @@ h1{ margin:0; font-size:22px; font-weight:800; letter-spacing:.2px; }
 /* Force flexbox and vertical centering */
 .site-title {
   display: flex;
-  align-items: center;   /* 👈 this ensures vertical centering */
-  gap: 12px;
-  margin: 16px 0 18px;
-  line-height: 1.2;
+  align-items: center; /* ensures children are aligned vertically */
+  gap: 10px;           /* space between logo and text */
 }
 
-/* Logo styles */
-.site-title .logo {
-  width: 34px;
-  height: 34px;
+.site-title img {
+  height: 36px;        /* tweak as needed */
+  width: auto;
   display: inline-block;
-  object-fit: contain;
-  border-radius: 50%;
-  flex-shrink: 0;         /* Prevent squishing */
+  vertical-align: middle; /* 👈 ensures proper centering with text */
 }
 
 /* Title text */
