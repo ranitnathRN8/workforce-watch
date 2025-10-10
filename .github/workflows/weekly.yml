@@ -2,7 +2,7 @@ name: Weekly scrape & Deploy Pages
 
 on:
   schedule:
-    - cron: '30 0 * * 3'   # Mon 00:30 UTC (~06:00 IST)
+    - cron: '30 0 * * 1'   # Mon 00:30 UTC (~06:00 IST)
   workflow_dispatch: {}
 
 permissions:
@@ -17,6 +17,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0            # we will commit & push
+          persist-credentials: true # use GITHUB_TOKEN to push
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -34,7 +37,26 @@ jobs:
           SHRM_COVEO_TOKEN: ${{ secrets.SHRM_COVEO_TOKEN }}
         run: |
           python scraper/run.py --week current
+          echo "---- After scraper ----"
+          ls -lah site || true
+          ls -lah site/data || true
+          find site/data -type f -name '*.json' -print | sed 's/^/  /' || true
 
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit changes (if any) to repo
+        run: |
+          git add -A site/data
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "Weekly scrape: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          git push
+          
       - name: Upload artifact for Pages
         uses: actions/upload-pages-artifact@v3
         with:
