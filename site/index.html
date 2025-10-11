@@ -38,6 +38,7 @@
             <input type="date" id="day" />
           </div>
           <button id="loadToday" class="btn secondary">Today</button>
+          <button id="openFavourites" class="btn">Favourites</button>
         </div>
       </div>
 
@@ -63,7 +64,22 @@
     <div id="meta" class="meta"></div>
     <div id="results" class="grid" aria-live="polite"></div>
     <!-- pagination injected after #results -->
+
+    <section id="favourites-view" hidden>
+      <div class="fav-toolbar">
+        <label>Year <select id="fav-year"></select></label>
+        <label>Month <select id="fav-month"></select></label>
+      </div>
+      <div id="fav-list"></div>
+    </section>
+
   </div>
+
+  <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
+  <script>
+    window.SUPABASE_URL = "https://pxagmkwtmolvhdmryepv.supabase.co";
+    window.SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InB4YWdta3d0bW9sdmhkbXJ5ZXB2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjAwMzk4NzEsImV4cCI6MjA3NTYxNTg3MX0.t--8DvvuPSkI4qD1HyufnDlTdM6c_GO7T_UXtj5CErw";
+  </script>
 
   <script src="app.js"></script>
 </body>

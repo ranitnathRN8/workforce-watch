@@ -5,7 +5,7 @@
    Data path: /data/<year>/<year>-W<week>.json
 */
 
-const $  = (s) => document.querySelector(s);
+const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
 
 /* ---------- State ---------- */
@@ -16,6 +16,12 @@ const state = {
   pageSize: 10,
   page: 1
 };
+
+/* ----------  view routing ---------- */
+state.route = "week";        // "week" | "favourites"
+state.favYear = null;        // favourites UI selections
+state.favMonth = null;
+
 
 /* ---------- Helpers ---------- */
 
@@ -62,6 +68,73 @@ function escapeHtml(s) {
   }[ch]));
 }
 
+function navigateToWeekAndLoad(dateStr) {
+  const d = parseLocalDate(dateStr || localISODate(new Date()));
+  const { year, week } = isoWeekLocal(d);
+  // Switch route first so week view becomes visible
+  if (location.hash !== '#/') location.hash = '#/';
+  // Ensure week view UI is shown (if you have showWeekView(), call it)
+  if (typeof showWeekView === 'function') showWeekView();
+  // Then load the data
+  loadWeek(year, week);
+}
+
+
+/* ---------- Supabase Client ---------- */
+let supabase = null;
+if (window.SUPABASE_URL && window.SUPABASE_ANON_KEY && window.supabase) {
+  supabase = window.supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY);
+  console.log("Supabase ready");
+} else {
+  console.warn("Supabase not configured; favourites disabled");
+}
+
+// small helpers for favourites
+async function sha256(text) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return [...new Uint8Array(buf)].map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+function dateFromIsoYearWeek(isoYear, isoWeek) {
+  const d = new Date(Date.UTC(isoYear, 0, 1 + (isoWeek - 1) * 7));
+  const dow = d.getUTCDay() || 7;
+  const th = new Date(d);
+  th.setUTCDate(d.getUTCDate() + (4 - dow));
+  return th;
+}
+function weekOfMonthFromDateStr(dateStr) {
+  const d = new Date(dateStr + "T00:00:00Z");
+  const first = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1));
+  const offset = (first.getUTCDay() + 6) % 7; // Monday=0
+  const dom = d.getUTCDate();
+  return Math.ceil((dom + offset)/7);
+}
+async function favIsOn(url) {
+  if (!supabase) return false;
+  const url_hash = await sha256(url);
+  const { data, error } = await supabase.from('favourites').select('id').eq('url_hash', url_hash).maybeSingle();
+  if (error && error.code !== 'PGRST116') console.warn(error);
+  return !!data;
+}
+async function favToggle({ url, title, summary, isoYear, isoWeek, published }) {
+  if (!supabase) return false;
+  const url_hash = await sha256(url);
+  const { data: existing } = await supabase.from('favourites').select('id').eq('url_hash', url_hash).maybeSingle();
+  if (existing) { await supabase.from('favourites').delete().eq('url_hash', url_hash); return false; }
+  const day = (published ? new Date(published) : dateFromIsoYearWeek(isoYear, isoWeek)).toISOString().slice(0,10);
+  await supabase.from('favourites').insert({
+    url_hash, url, title, summary: summary || null, iso_year: isoYear, iso_week: isoWeek, day_date: day
+  });
+  return true;
+}
+async function favListByMonth(year, month) {
+  if (!supabase) return [];
+  const start = new Date(Date.UTC(year, month-1, 1)).toISOString().slice(0,10);
+  const end   = new Date(Date.UTC(year, month,   1)).toISOString().slice(0,10);
+  const { data, error } = await supabase.from('favourites').select('*').gte('day_date', start).lt('day_date', end).order('day_date', { ascending: false });
+  if (error) { console.error(error); return []; }
+  return data || [];
+}
+
 /* ---------- Category dropdown ---------- */
 function buildCategoryOptions(items) {
   const sel = $("#category");
@@ -75,7 +148,7 @@ function buildCategoryOptions(items) {
 
 /* ---------- Filtering + Sorting + Pagination ---------- */
 function sortBySignificanceDesc(arr) {
-  return arr.sort((a,b) => {
+  return arr.sort((a, b) => {
     const sa = Number(a.significance) || 0;
     const sb = Number(b.significance) || 0;
     if (sb !== sa) return sb - sa;
@@ -134,7 +207,7 @@ function render(items, meta) {
     card.className = "card";
 
     let srcDomain = "";
-    try { srcDomain = new URL(it.url).hostname.replace(/^www\./, ""); } catch {}
+    try { srcDomain = new URL(it.url).hostname.replace(/^www\./, ""); } catch { }
 
     card.innerHTML = `
       <h3 class="title"><a href="${it.url}" target="_blank" rel="noopener">${escapeHtml(it.title || "(untitled)")}</a></h3>
@@ -161,6 +234,43 @@ function render(items, meta) {
       }
     `;
     frag.appendChild(card);
+
+    // Create the star button once the card is built
+    const favBtn = document.createElement("button");
+    favBtn.className = "fav-toggle";
+    favBtn.type = "button";
+    favBtn.textContent = "☆";                 // default (off)
+
+    // non-blocking init of the state
+    (async () => {
+      try {
+        if (await favIsOn(it.url)) {
+          favBtn.textContent = "★";
+          favBtn.classList.add("is-on");
+          favBtn.title = "Remove from favourites";
+        } else {
+          favBtn.title = "Add to favourites";
+        }
+      } catch { }
+    })();
+
+    favBtn.addEventListener("click", async () => {
+      favBtn.disabled = true;
+      const nowOn = await favToggle({
+        url: it.url,
+        title: it.title || "(untitled)",
+        summary: (it.summary_bullets || []).join(" • "),
+        isoYear, isoWeek, published: it.published || null
+      });
+      favBtn.textContent = nowOn ? "★" : "☆";
+      favBtn.classList.toggle("is-on", nowOn);
+      favBtn.title = nowOn ? "Remove from favourites" : "Add to favourites";
+      favBtn.disabled = false;
+    });
+
+    // attach to the card (top-right via CSS)
+    card.appendChild(favBtn);
+
   });
 
   container.appendChild(frag);
@@ -183,10 +293,10 @@ function renderPagination() {
   const buttons = [];
   buttons.push(`<button class="page-btn" data-act="prev" ${p === 1 ? "disabled" : ""}>‹ Prev</button>`);
 
-  const makeBtn = (n) => `<button class="page-btn ${n===p?"active":""}" data-page="${n}">${n}</button>`;
+  const makeBtn = (n) => `<button class="page-btn ${n === p ? "active" : ""}" data-page="${n}">${n}</button>`;
   const ellipsis = `<span class="ellipsis">…</span>`;
   const windowStart = Math.max(1, p - 2);
-  const windowEnd   = Math.min(pages, p + 2);
+  const windowEnd = Math.min(pages, p + 2);
 
   if (windowStart > 1) buttons.push(makeBtn(1));
   if (windowStart > 2) buttons.push(ellipsis);
@@ -214,6 +324,157 @@ function renderPagination() {
   });
 }
 
+// ----- FAVOURITES VIEW -----
+function initFavSelectorsOnce() {
+  const ySel = document.getElementById("fav-year");
+  const mSel = document.getElementById("fav-month");
+  if (!ySel || !mSel) return;
+
+  // Run only once
+  if (ySel.dataset.init === "1") return;
+
+  const now = new Date();
+  const currentYear = now.getUTCFullYear();
+
+  // ---- Year select (current year default) ----
+  ySel.innerHTML = "";
+  for (let y = currentYear - 2; y <= currentYear + 1; y++) {
+    const o = document.createElement("option");
+    o.value = String(y);
+    o.textContent = String(y);
+    if (y === currentYear) o.selected = true;
+    ySel.appendChild(o);
+  }
+
+  // ---- Month select (All by default) ----
+  mSel.innerHTML = "";
+  const optAll = document.createElement("option");
+  optAll.value = "";                 // empty = All months
+  optAll.textContent = "All";
+  optAll.selected = true;            // default to All
+  mSel.appendChild(optAll);
+
+  for (let m = 1; m <= 12; m++) {
+    const o = document.createElement("option");
+    o.value = String(m);
+    o.textContent = String(m).padStart(2, "0");
+    mSel.appendChild(o);
+  }
+
+  // ---- Wire listeners (only once) ----
+  ySel.addEventListener("change", refreshFavs);
+  mSel.addEventListener("change", refreshFavs);
+
+  // Mark initialized so we don't rebuild/wire twice
+  ySel.dataset.init = "1";
+}
+
+async function refreshFavs() {
+  const y = +$("#fav-year").value;
+  const m = $("#fav-month").value === "all" ? "all" : +$("#fav-month").value;
+  state.favYear = y;
+  state.favMonth = m;
+
+  const listEl = $("#fav-list");
+  listEl.innerHTML = "Loading...";
+  const rows = await favListByMonth(y, m);
+
+  if (!rows.length) {
+    listEl.innerHTML = "<p>No favourites yet.</p>";
+    return;
+  }
+
+  // Create grid like normal view
+  listEl.innerHTML = "";
+  const grid = document.createElement("div");
+  grid.className = "grid";
+
+  for (const r of rows) {
+    const card = document.createElement("div");
+    card.className = "card";
+
+    card.innerHTML = `
+      <div class="title"><a href="${r.url}" target="_blank" rel="noopener">${escapeHtml(r.title)}</a></div>
+      <div class="meta-line">
+        <span class="badge">${escapeHtml(r.category || "Misc")}</span>
+        <span class="src">${r.source || ""}</span>
+      </div>
+      <ul class="bullets">${(r.bullets || [])
+        .map((b) => `<li>${escapeHtml(b)}</li>`)
+        .join("")}</ul>
+      <div class="companies">
+        ${(r.tags || [])
+          .map((t) => `<span class="chip">${escapeHtml(t)}</span>`)
+          .join("")}
+      </div>
+      <button class="fav-toggle is-on" title="Remove from Favourites">★</button>
+    `;
+
+    const favBtn = card.querySelector(".fav-toggle");
+    favBtn.addEventListener("click", async () => {
+      await removeFav(r.url);
+      card.remove();
+      if (!grid.children.length) listEl.innerHTML = "<p>No favourites yet.</p>";
+    });
+
+    grid.appendChild(card);
+  }
+
+  listEl.appendChild(grid);
+}
+
+async function showFavouritesView() {
+  state.route = "favourites";
+
+  // Hide week list + meta + pagination
+  $("#results").style.display = "none";
+  $("#meta").style.display = "none";
+  $("#pagination")?.classList.add("hidden");
+
+  // Show favourites view
+  $("#favourites-view").hidden = false;
+
+  // Highlight top bar button (if present)
+  document.getElementById("openFavourites")?.classList.add("active");
+
+  // Ensure selectors exist and are set
+  initFavSelectorsOnce();
+
+  const ySel = document.getElementById("fav-year");
+  const mSel = document.getElementById("fav-month");
+
+  // Always default to current year + All months when opening
+  const now = new Date();
+  ySel.value = String(now.getUTCFullYear());
+  mSel.value = "";     // empty string means "All"
+
+  await refreshFavs();
+}
+
+function showWeekView() {
+  state.route = "week";
+  $("#favourites-view").hidden = true;
+  $("#results").style.display = "";   // show weekly list
+  $("#meta").style.display = "";      // show meta
+  $("#pagination")?.classList.remove("hidden");
+  document.getElementById("openFavourites")?.classList.remove("active");
+}
+
+// ----- tiny router -----
+function routeFromHash() {
+  return location.hash.startsWith("#/favourites") ? "favourites" : "week";
+}
+window.addEventListener("hashchange", () => {
+  if (location.hash.startsWith("#/favourites")) {
+    showFavouritesView();
+  } else {
+    // Back to week view: load the currently selected day (or today)
+    const v = $("#day")?.value || localISODate(new Date());
+    navigateToWeekAndLoad(v);
+  }
+});
+
+
 /* ---------- Data loading ---------- */
 function setItems(items, meta) {
   state.allItems = Array.isArray(items) ? items.slice() : [];
@@ -238,12 +499,10 @@ async function loadWeek(year, week) {
 /* ---------- UI bootstrap ---------- */
 function attachEvents() {
   // Auto-load the week when date changes
-  $("#day").addEventListener("change", () => {
+  $("#day")?.addEventListener("change", () => {
     const v = $("#day").value;
     if (!v) return;
-    const d = parseLocalDate(v);
-    const { year, week } = isoWeekLocal(d);
-    loadWeek(year, week);
+    navigateToWeekAndLoad(v);
   });
 
   // Calendar icon opens the picker
@@ -254,12 +513,12 @@ function attachEvents() {
   });
 
   // Today: set date + load (LOCAL today)
-  $("#loadToday").addEventListener("click", () => {
+  $("#loadToday")?.addEventListener("click", () => {
     const today = localISODate(new Date());
     $("#day").value = today;
-    const { year, week } = isoWeekLocal(parseLocalDate(today));
-    loadWeek(year, week);
+    navigateToWeekAndLoad(today);
   });
+
 
   $("#category").addEventListener("change", () => {
     applyFilters();
@@ -270,6 +529,11 @@ function attachEvents() {
     applyFilters();
     render(paginatedItems(), state.meta || { items: [], generated_at: "" });
   });
+
+  $("#openFavourites").addEventListener("click", () => { location.hash = "#/favourites"; });
+
+  // also ensure default route on load
+  if (!location.hash) location.hash = "#/week";
 }
 
 window.addEventListener("DOMContentLoaded", () => {
@@ -279,4 +543,18 @@ window.addEventListener("DOMContentLoaded", () => {
   attachEvents();
   const { year, week } = isoWeekLocal(parseLocalDate(today));
   loadWeek(year, week);
+});
+
+window.addEventListener("DOMContentLoaded", () => {
+  // existing: set date + load week
+  const today = localISODate(new Date());
+  $("#day").value = today;
+  const { year, week } = isoWeekLocal(parseLocalDate(today));
+  attachEvents();
+
+  if (routeFromHash() === "favourites") {
+    showFavouritesView();
+  } else {
+    loadWeek(year, week);
+  }
 });
