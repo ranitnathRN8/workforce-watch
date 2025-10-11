@@ -14,14 +14,11 @@ const state = {
   filtered: [],   // after category + search, sorted
   meta: null,
   pageSize: 10,
-  page: 1
+  page: 1,
+  route: "week",        // "week" | "favourites"
+  favYear: null,
+  favMonth: null,
 };
-
-/* ----------  view routing ---------- */
-state.route = "week";        // "week" | "favourites"
-state.favYear = null;        // favourites UI selections
-state.favMonth = null;
-
 
 /* ---------- Helpers ---------- */
 
@@ -73,27 +70,71 @@ function navigateToWeekAndLoad(dateStr) {
   const { year, week } = isoWeekLocal(d);
   // Switch route first so week view becomes visible
   if (location.hash !== '#/') location.hash = '#/';
-  // Ensure week view UI is shown (if you have showWeekView(), call it)
   if (typeof showWeekView === 'function') showWeekView();
   // Then load the data
   loadWeek(year, week);
 }
 
-
-/* ---------- Supabase Client ---------- */
-let supabase = null;
-if (window.SUPABASE_URL && window.SUPABASE_ANON_KEY && window.supabase) {
-  supabase = window.supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY);
-  console.log("Supabase ready");
-} else {
-  console.warn("Supabase not configured; favourites disabled");
+// Parse week values that might be "41", "W41", or "2025-W41" -> 41
+function parseIsoWeekish(val) {
+  if (Number.isInteger(val)) return val;
+  if (typeof val === "string") {
+    const m = val.match(/W(\d{1,2})$/i) || val.match(/(\d{1,2})$/);
+    if (m) {
+      const n = +m[1];
+      if (Number.isInteger(n)) return n;
+    }
+    const n = parseInt(val, 10);
+    if (!Number.isNaN(n)) return n;
+  }
+  return null;
 }
 
-// small helpers for favourites
+
+/* ---------- Supabase Client (single global) ---------- */
+// Prefer build-time env (bundlers) then runtime env.js
+const SUPABASE_URL =
+  (typeof process !== "undefined" && process.env?.SUPABASE_URL) || // optional (bundler/dev)
+  window.SUPABASE_URL;
+
+const SUPABASE_ANON_KEY =
+  (typeof process !== "undefined" && process.env?.SUPABASE_ANON_KEY) || // optional (bundler/dev)
+  window.SUPABASE_ANON_KEY;
+
+const supa =
+  (SUPABASE_URL && SUPABASE_ANON_KEY && window.supabase)
+    ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+    : null;
+
+if (!supa) console.warn("⚠️ Supabase not configured; favourites disabled");
+
+
+/* ---------- Favourites helpers ---------- */
+// Robust sha256 with fallback for non-secure origins
 async function sha256(text) {
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
-  return [...new Uint8Array(buf)].map(b=>b.toString(16).padStart(2,'0')).join('');
+  // Prefer WebCrypto when available (secure origins)
+  if (window.crypto && window.crypto.subtle) {
+    const buf = await window.crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(text)
+    );
+    return [...new Uint8Array(buf)]
+      .map(b => b.toString(16).padStart(2, "0"))
+      .join("");
+  }
+
+  // Fallback: FNV-1a 32-bit (non-cryptographic but stable)
+  // Ensures favourites still work on "Not Secure" local hosts.
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    // h *= 16777619 (with overflow), written as shifts for speed
+    h += (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24);
+  }
+  h >>>= 0;
+  return h.toString(16).padStart(8, "0"); // shorter, but unique enough as a key
 }
+
 function dateFromIsoYearWeek(isoYear, isoWeek) {
   const d = new Date(Date.UTC(isoYear, 0, 1 + (isoWeek - 1) * 7));
   const dow = d.getUTCDay() || 7;
@@ -106,31 +147,118 @@ function weekOfMonthFromDateStr(dateStr) {
   const first = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1));
   const offset = (first.getUTCDay() + 6) % 7; // Monday=0
   const dom = d.getUTCDate();
-  return Math.ceil((dom + offset)/7);
+  return Math.ceil((dom + offset) / 7);
 }
 async function favIsOn(url) {
-  if (!supabase) return false;
+  if (!supa) return false;
   const url_hash = await sha256(url);
-  const { data, error } = await supabase.from('favourites').select('id').eq('url_hash', url_hash).maybeSingle();
+  const { data, error } = await supa.from('favourites').select('id').eq('url_hash', url_hash).maybeSingle();
   if (error && error.code !== 'PGRST116') console.warn(error);
   return !!data;
 }
-async function favToggle({ url, title, summary, isoYear, isoWeek, published }) {
-  if (!supabase) return false;
+
+// --- helpers: robust date parsing + safe day resolver ---
+function toValidDate(x) {
+  if (x instanceof Date && !isNaN(x)) return x;
+  if (typeof x === "number") {
+    const d = new Date(x);
+    return isNaN(d) ? null : d;
+  }
+  if (typeof x === "string" && x.trim()) {
+    const t = Date.parse(x);
+    if (!Number.isNaN(t)) return new Date(t);
+  }
+  return null;
+}
+
+function resolveDayDate(isoYear, isoWeek, published) {
+  // 1) published wins if valid
+  const pd = toValidDate(published);
+  if (pd) return pd.toISOString().slice(0, 10);
+
+  // 2) try the passed isoYear/isoWeek
+  const y1 = Number(isoYear);
+  const w1 = parseIsoWeekish(isoWeek);
+  if (Number.isInteger(y1) && Number.isInteger(w1)) {
+    return dateFromIsoYearWeek(y1, w1).toISOString().slice(0, 10);
+  }
+
+  // 3) try state.meta
+  const y2 = Number(state?.meta?.iso_year ?? state?.meta?.year);
+  const w2 = parseIsoWeekish(state?.meta?.iso_week ?? state?.meta?.week);
+  if (Number.isInteger(y2) && Number.isInteger(w2)) {
+    return dateFromIsoYearWeek(y2, w2).toISOString().slice(0, 10);
+  }
+
+  // 4) fallback: today (local)
+  return localISODate(new Date());
+}
+
+async function favToggle(article, { isoYear, isoWeek, published } = {}) {
+  if (!supa) return false;
+
+  const url_hash = await sha256(article.url);
+
+  // Already a favourite?
+  const { data: exists, error: checkErr } = await supa
+    .from("favourites")
+    .select("id")
+    .eq("url_hash", url_hash)
+    .maybeSingle();
+  if (checkErr && checkErr.code !== "PGRST116") console.error("favToggle check error:", checkErr);
+
+  if (exists) {
+    const { error: delErr } = await supa.from("favourites").delete().eq("url_hash", url_hash);
+    if (delErr) { console.error("favToggle delete error:", delErr); return true; }
+    return false; // OFF
+  }
+
+  // Normalize year/week
+  const yearFinal =
+    Number.isInteger(isoYear) ? isoYear :
+      Number(state?.meta?.iso_year ?? state?.meta?.year);
+
+  const weekFinal =
+    parseIsoWeekish(isoWeek) ??
+    parseIsoWeekish(state?.meta?.iso_week ?? state?.meta?.week);
+
+  const day = resolveDayDate(yearFinal, weekFinal, published);
+
+  const payload = {
+    url_hash,
+    url: article.url,
+    title: article.title || "(untitled)",
+    summary: (article.summary_bullets || []).join(" • ") || null,
+    iso_year: yearFinal ?? null,              // INTEGER
+    iso_week: weekFinal ?? null,              // INTEGER
+    day_date: day                             // "YYYY-MM-DD"
+  };
+
+  const { error: insErr } = await supa.from("favourites").insert(payload);
+  if (insErr) {
+    console.error("favToggle insert error:", insErr, payload);
+    return false;
+  }
+  return true; // ON
+}
+
+async function removeFav(url) {
+  if (!supa) return;
   const url_hash = await sha256(url);
-  const { data: existing } = await supabase.from('favourites').select('id').eq('url_hash', url_hash).maybeSingle();
-  if (existing) { await supabase.from('favourites').delete().eq('url_hash', url_hash); return false; }
-  const day = (published ? new Date(published) : dateFromIsoYearWeek(isoYear, isoWeek)).toISOString().slice(0,10);
-  await supabase.from('favourites').insert({
-    url_hash, url, title, summary: summary || null, iso_year: isoYear, iso_week: isoWeek, day_date: day
-  });
-  return true;
+  await supa.from('favourites').delete().eq('url_hash', url_hash);
 }
 async function favListByMonth(year, month) {
-  if (!supabase) return [];
-  const start = new Date(Date.UTC(year, month-1, 1)).toISOString().slice(0,10);
-  const end   = new Date(Date.UTC(year, month,   1)).toISOString().slice(0,10);
-  const { data, error } = await supabase.from('favourites').select('*').gte('day_date', start).lt('day_date', end).order('day_date', { ascending: false });
+  if (!supa) return [];
+  if (!month || month === 'all' || month === "") {
+    const { data, error } = await supa.from('favourites')
+      .select('*').eq('iso_year', year).order('day_date', { ascending: false });
+    if (error) { console.error(error); return []; }
+    return data || [];
+  }
+  const start = new Date(Date.UTC(year, month - 1, 1)).toISOString().slice(0, 10);
+  const end = new Date(Date.UTC(year, month, 1)).toISOString().slice(0, 10);
+  const { data, error } = await supa.from('favourites')
+    .select('*').gte('day_date', start).lt('day_date', end).order('day_date', { ascending: false });
   if (error) { console.error(error); return []; }
   return data || [];
 }
@@ -201,6 +329,13 @@ function render(items, meta) {
   }
 
   const frag = document.createDocumentFragment();
+  // ✅ ensure these exist for favourites payload
+  // Get year/week from meta and normalize
+  const metaYear = Number(meta?.iso_year ?? meta?.year);
+  const metaWeek = parseIsoWeekish(meta?.iso_week ?? meta?.week);
+  const { year: isoYear, week: isoWeek } = (meta && (meta.iso_year || meta.year))
+    ? { year: meta.iso_year || meta.year, week: meta.iso_week || meta.week }
+    : (state.meta || {});
 
   items.forEach(it => {
     const card = document.createElement("div");
@@ -211,37 +346,21 @@ function render(items, meta) {
 
     card.innerHTML = `
       <h3 class="title"><a href="${it.url}" target="_blank" rel="noopener">${escapeHtml(it.title || "(untitled)")}</a></h3>
-
-      <div class="meta-line">
-        <span class="badge">${escapeHtml(it.category || "Uncategorized")}</span>
-      </div>
-
-      <div class="meta-line">
-        <span class="stars" title="Significance">${starBar(it.significance || 1)}</span>
-      </div>
-
-      <div class="meta-line">
-        <span class="src">${escapeHtml(srcDomain)}</span>
-      </div>
-
-      <ul class="bullets">
-        ${(it.summary_bullets || []).map(b => `<li>${escapeHtml(b)}</li>`).join("")}
-      </ul>
-
+      <div class="meta-line"><span class="badge">${escapeHtml(it.category || "Uncategorized")}</span></div>
+      <div class="meta-line"><span class="stars" title="Significance">${starBar(it.significance || 1)}</span></div>
+      <div class="meta-line"><span class="src">${escapeHtml(srcDomain)}</span></div>
+      <ul class="bullets">${(it.summary_bullets || []).map(b => `<li>${escapeHtml(b)}</li>`).join("")}</ul>
       ${(it.companies && it.companies.length)
-        ? `<div class="companies">` + it.companies.map(c => `<span class="chip">${escapeHtml(c)}</span>`).join("") + `</div>`
-        : ``
-      }
+        ? `<div class="companies">${it.companies.map(c => `<span class="chip">${escapeHtml(c)}</span>`).join("")}</div>` : ``}
     `;
-    frag.appendChild(card);
 
-    // Create the star button once the card is built
+    // ⭐ top-right favourite toggle
     const favBtn = document.createElement("button");
     favBtn.className = "fav-toggle";
     favBtn.type = "button";
-    favBtn.textContent = "☆";                 // default (off)
+    favBtn.textContent = "☆";
 
-    // non-blocking init of the state
+    // init async
     (async () => {
       try {
         if (await favIsOn(it.url)) {
@@ -256,25 +375,22 @@ function render(items, meta) {
 
     favBtn.addEventListener("click", async () => {
       favBtn.disabled = true;
-      const nowOn = await favToggle({
-        url: it.url,
-        title: it.title || "(untitled)",
-        summary: (it.summary_bullets || []).join(" • "),
-        isoYear, isoWeek, published: it.published || null
-      });
-      favBtn.textContent = nowOn ? "★" : "☆";
-      favBtn.classList.toggle("is-on", nowOn);
-      favBtn.title = nowOn ? "Remove from favourites" : "Add to favourites";
+      const on = await favToggle(
+        { url: it.url, title: it.title, summary_bullets: it.summary_bullets },
+        { isoYear: metaYear, isoWeek: metaWeek, published: it.published || null }
+      );
+      favBtn.textContent = on ? "★" : "☆";
+      favBtn.classList.toggle("is-on", on);
+      favBtn.title = on ? "Remove from favourites" : "Add to favourites";
       favBtn.disabled = false;
     });
 
-    // attach to the card (top-right via CSS)
     card.appendChild(favBtn);
-
+    frag.appendChild(card);
   });
 
   container.appendChild(frag);
-  $("#meta").textContent = `${meta.items.length} items • Generated at ${meta.generated_at}`;
+  $("#meta").textContent = `${meta.items?.length ?? items.length} items • Generated at ${meta.generated_at || ""}`;
   renderPagination();
 }
 
@@ -324,19 +440,17 @@ function renderPagination() {
   });
 }
 
-// ----- FAVOURITES VIEW -----
+/* ---------- FAVOURITES VIEW ---------- */
 function initFavSelectorsOnce() {
   const ySel = document.getElementById("fav-year");
   const mSel = document.getElementById("fav-month");
   if (!ySel || !mSel) return;
-
-  // Run only once
   if (ySel.dataset.init === "1") return;
 
   const now = new Date();
   const currentYear = now.getUTCFullYear();
 
-  // ---- Year select (current year default) ----
+  // Year select
   ySel.innerHTML = "";
   for (let y = currentYear - 2; y <= currentYear + 1; y++) {
     const o = document.createElement("option");
@@ -346,14 +460,11 @@ function initFavSelectorsOnce() {
     ySel.appendChild(o);
   }
 
-  // ---- Month select (All by default) ----
+  // Month select (All default)
   mSel.innerHTML = "";
   const optAll = document.createElement("option");
-  optAll.value = "";                 // empty = All months
-  optAll.textContent = "All";
-  optAll.selected = true;            // default to All
+  optAll.value = ""; optAll.textContent = "All"; optAll.selected = true;
   mSel.appendChild(optAll);
-
   for (let m = 1; m <= 12; m++) {
     const o = document.createElement("option");
     o.value = String(m);
@@ -361,124 +472,126 @@ function initFavSelectorsOnce() {
     mSel.appendChild(o);
   }
 
-  // ---- Wire listeners (only once) ----
   ySel.addEventListener("change", refreshFavs);
   mSel.addEventListener("change", refreshFavs);
-
-  // Mark initialized so we don't rebuild/wire twice
   ySel.dataset.init = "1";
 }
 
 async function refreshFavs() {
-  const y = +$("#fav-year").value;
-  const m = $("#fav-month").value === "all" ? "all" : +$("#fav-month").value;
+  const y = parseInt($("#fav-year").value, 10);
+  const mVal = $("#fav-month").value;   // "" = All months
   state.favYear = y;
-  state.favMonth = m;
+  state.favMonth = mVal === "" ? null : parseInt(mVal, 10);
 
-  const listEl = $("#fav-list");
-  listEl.innerHTML = "Loading...";
-  const rows = await favListByMonth(y, m);
+  const host = $("#fav-list");
+  host.innerHTML = "Loading…";
 
-  if (!rows.length) {
-    listEl.innerHTML = "<p>No favourites yet.</p>";
+  let rows = [];
+  try {
+    if (mVal === "") {
+      const { data, error } = await supa
+        .from("favourites").select("*")
+        .eq("iso_year", y)
+        .order("day_date", { ascending: false });
+      if (error) throw error;
+      rows = data || [];
+    } else {
+      const m = parseInt(mVal, 10);
+      const start = new Date(Date.UTC(y, m - 1, 1)).toISOString().slice(0, 10);
+      const end   = new Date(Date.UTC(y, m, 1)).toISOString().slice(0, 10);
+      const { data, error } = await supa
+        .from("favourites").select("*")
+        .gte("day_date", start).lt("day_date", end)
+        .order("day_date", { ascending: false });
+      if (error) throw error;
+      rows = data || [];
+    }
+  } catch (e) {
+    console.error(e);
+    host.textContent = "Error loading favourites.";
     return;
   }
 
-  // Create grid like normal view
-  listEl.innerHTML = "";
-  const grid = document.createElement("div");
-  grid.className = "grid";
-
-  for (const r of rows) {
+  // builder for a favourite card (yellow-tinted)
+  const buildFavCard = (r) => {
     const card = document.createElement("div");
-    card.className = "card";
+    card.className = "card favourite";
+    const bullets = (r.summary || "")
+      .split("•")
+      .map(s => s.trim())
+      .filter(Boolean);
 
     card.innerHTML = `
-      <div class="title"><a href="${r.url}" target="_blank" rel="noopener">${escapeHtml(r.title)}</a></div>
+      <div class="title">
+        <a href="${r.url}" target="_blank" rel="noopener">${escapeHtml(r.title || "(untitled)")}</a>
+      </div>
       <div class="meta-line">
-        <span class="badge">${escapeHtml(r.category || "Misc")}</span>
-        <span class="src">${r.source || ""}</span>
+        <span class="badge">Favourites</span>
+        <span class="src" title="Saved date">${r.day_date}</span>
       </div>
-      <ul class="bullets">${(r.bullets || [])
-        .map((b) => `<li>${escapeHtml(b)}</li>`)
-        .join("")}</ul>
-      <div class="companies">
-        ${(r.tags || [])
-          .map((t) => `<span class="chip">${escapeHtml(t)}</span>`)
-          .join("")}
-      </div>
-      <button class="fav-toggle is-on" title="Remove from Favourites">★</button>
+      <ul class="bullets">${bullets.map(b => `<li>${escapeHtml(b)}</li>`).join("")}</ul>
+      <button class="fav-toggle is-on" title="Remove from favourites">★</button>
     `;
 
-    const favBtn = card.querySelector(".fav-toggle");
-    favBtn.addEventListener("click", async () => {
-      await removeFav(r.url);
-      card.remove();
-      if (!grid.children.length) listEl.innerHTML = "<p>No favourites yet.</p>";
+    const star = card.querySelector(".fav-toggle");
+    star.addEventListener("click", async () => {
+      if (star.disabled) return;
+      star.disabled = true;
+      try {
+        await removeFav(r.url);
+        // ✅ Re-fetch & re-render everything so other months/grids remain visible
+        await refreshFavs();
+      } catch (e) {
+        console.error(e);
+      } finally {
+        star.disabled = false;
+      }
     });
 
-    grid.appendChild(card);
+    return card;
+  };
+
+  if (!rows.length) {
+    host.innerHTML = "<p>No favourites yet.</p>";
+    return;
   }
 
-  listEl.appendChild(grid);
-}
+  host.innerHTML = "";
 
-async function showFavouritesView() {
-  state.route = "favourites";
+  if (mVal === "") {
+    // All months — group by month
+    const byMonth = {};
+    for (const r of rows) {
+      const m = new Date(r.day_date + "T00:00:00Z").getUTCMonth() + 1;
+      (byMonth[m] ??= []).push(r);
+    }
+    const months = Object.keys(byMonth).map(Number).sort((a, b) => a - b);
 
-  // Hide week list + meta + pagination
-  $("#results").style.display = "none";
-  $("#meta").style.display = "none";
-  $("#pagination")?.classList.add("hidden");
+    for (const m of months) {
+      const monthName = new Date(Date.UTC(y, m - 1, 1))
+        .toLocaleString(undefined, { month: "long", timeZone: "UTC" });
+      const h2 = document.createElement("h2");
+      h2.textContent = `${monthName} ${y}`;
+      host.appendChild(h2);
 
-  // Show favourites view
-  $("#favourites-view").hidden = false;
-
-  // Highlight top bar button (if present)
-  document.getElementById("openFavourites")?.classList.add("active");
-
-  // Ensure selectors exist and are set
-  initFavSelectorsOnce();
-
-  const ySel = document.getElementById("fav-year");
-  const mSel = document.getElementById("fav-month");
-
-  // Always default to current year + All months when opening
-  const now = new Date();
-  ySel.value = String(now.getUTCFullYear());
-  mSel.value = "";     // empty string means "All"
-
-  await refreshFavs();
-}
-
-function showWeekView() {
-  state.route = "week";
-  $("#favourites-view").hidden = true;
-  $("#results").style.display = "";   // show weekly list
-  $("#meta").style.display = "";      // show meta
-  $("#pagination")?.classList.remove("hidden");
-  document.getElementById("openFavourites")?.classList.remove("active");
-}
-
-// ----- tiny router -----
-function routeFromHash() {
-  return location.hash.startsWith("#/favourites") ? "favourites" : "week";
-}
-window.addEventListener("hashchange", () => {
-  if (location.hash.startsWith("#/favourites")) {
-    showFavouritesView();
+      const grid = document.createElement("div");
+      grid.className = "grid";
+      byMonth[m].forEach(r => grid.appendChild(buildFavCard(r)));
+      host.appendChild(grid);
+    }
   } else {
-    // Back to week view: load the currently selected day (or today)
-    const v = $("#day")?.value || localISODate(new Date());
-    navigateToWeekAndLoad(v);
+    // Single month
+    const grid = document.createElement("div");
+    grid.className = "grid";
+    rows.forEach(r => grid.appendChild(buildFavCard(r)));
+    host.appendChild(grid);
   }
-});
+}
 
-
-/* ---------- Data loading ---------- */
+/* ---------- Week load & bootstrap ---------- */
 function setItems(items, meta) {
   state.allItems = Array.isArray(items) ? items.slice() : [];
-  state.meta = meta || null;
+  state.meta = (meta && meta.meta) ? meta.meta : meta; // allow either {items, meta} or meta directly
   buildCategoryOptions(state.allItems);
   applyFilters();
   render(paginatedItems(), state.meta || { items: [], generated_at: "" });
@@ -496,7 +609,6 @@ async function loadWeek(year, week) {
   }
 }
 
-/* ---------- UI bootstrap ---------- */
 function attachEvents() {
   // Auto-load the week when date changes
   $("#day")?.addEventListener("change", () => {
@@ -506,10 +618,9 @@ function attachEvents() {
   });
 
   // Calendar icon opens the picker
-  $("#openPicker").addEventListener("click", () => {
+  $("#openPicker")?.addEventListener("click", () => {
     const el = $("#day");
-    if (el.showPicker) el.showPicker();
-    else el.focus();
+    if (el?.showPicker) el.showPicker(); else el?.focus();
   });
 
   // Today: set date + load (LOCAL today)
@@ -519,42 +630,59 @@ function attachEvents() {
     navigateToWeekAndLoad(today);
   });
 
-
-  $("#category").addEventListener("change", () => {
+  $("#category")?.addEventListener("change", () => {
     applyFilters();
     render(paginatedItems(), state.meta || { items: [], generated_at: "" });
   });
 
-  $("#search").addEventListener("input", () => {
+  $("#search")?.addEventListener("input", () => {
     applyFilters();
     render(paginatedItems(), state.meta || { items: [], generated_at: "" });
   });
 
-  $("#openFavourites").addEventListener("click", () => { location.hash = "#/favourites"; });
+  $("#openFavourites")?.addEventListener("click", () => { location.hash = "#/favourites"; });
 
-  // also ensure default route on load
   if (!location.hash) location.hash = "#/week";
 }
 
+/* ---------- Router ---------- */
+function showFavouritesView() {
+  state.route = "favourites";
+  $("#results").style.display = "none";
+  $("#meta").style.display = "none";
+  $("#pagination")?.classList.add("hidden");
+  $("#favourites-view").hidden = false;
+  document.getElementById("openFavourites")?.classList.add("active");
+  initFavSelectorsOnce();
+  const now = new Date();
+  $("#fav-year").value = String(now.getUTCFullYear());
+  $("#fav-month").value = ""; // All
+  refreshFavs();
+}
+function showWeekView() {
+  state.route = "week";
+  $("#favourites-view").hidden = true;
+  $("#results").style.display = "";
+  $("#meta").style.display = "";
+  $("#pagination")?.classList.remove("hidden");
+  document.getElementById("openFavourites")?.classList.remove("active");
+}
+
+window.addEventListener("hashchange", () => {
+  if (location.hash.startsWith("#/favourites")) {
+    showFavouritesView();
+  } else {
+    // Back to week view: load the currently selected day (or today)
+    const v = $("#day")?.value || localISODate(new Date());
+    navigateToWeekAndLoad(v);
+  }
+});
+
+/* ---------- Boot ---------- */
 window.addEventListener("DOMContentLoaded", () => {
-  // Default: local today
   const today = localISODate(new Date());
   $("#day").value = today;
   attachEvents();
   const { year, week } = isoWeekLocal(parseLocalDate(today));
   loadWeek(year, week);
-});
-
-window.addEventListener("DOMContentLoaded", () => {
-  // existing: set date + load week
-  const today = localISODate(new Date());
-  $("#day").value = today;
-  const { year, week } = isoWeekLocal(parseLocalDate(today));
-  attachEvents();
-
-  if (routeFromHash() === "favourites") {
-    showFavouritesView();
-  } else {
-    loadWeek(year, week);
-  }
 });
